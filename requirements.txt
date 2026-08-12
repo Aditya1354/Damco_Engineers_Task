@@ -1,0 +1,19 @@
+# Validated API family: pyannote.audio 4.x / PyTorch 2.10 / TorchCodec 0.10.
+# Python 3.10-3.12 is recommended for the smoothest Windows ML-wheel experience.
+python-dotenv
+numpy
+
+torch
+torchaudio
+torchcodec
+
+faster-whisper
+ctranslate2
+pyannote.audio
+sentence-transformers
+faiss-cpu
+groq
+streamlit
+
+# Bundles an FFmpeg executable on Windows/macOS/Linux wheels; avoids PATH-only setup.
+imageio-ffmpeg

@@ -1,0 +1,67 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Keep runtime directory skeletons, ignore all generated/private contents.
+data/*
+!data/agents/
+!data/calls/
+data/agents/*
+!data/agents/.gitkeep
+data/calls/*
+!data/calls/.gitkeep
+
+uploads/*
+!uploads/agents/
+!uploads/calls/
+uploads/agents/*
+!uploads/agents/.gitkeep
+uploads/calls/*
+!uploads/calls/.gitkeep
+
+models/*
+!models/.gitkeep
+!models/whisper/
+!models/pyannote/
+!models/sentence_transformers/
+models/whisper/*
+!models/whisper/.gitkeep
+models/pyannote/*
+!models/pyannote/.gitkeep
+models/sentence_transformers/*
+!models/sentence_transformers/.gitkeep
+
+samples/*
+!samples/.gitkeep
+
+# Generated ML artifacts
+*.npy
+*.npz
+*.faiss
+*.rttm
+chat_history.jsonl
+pipeline_error.json
+
+# Audio (never commit uploaded or generated recordings)
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.aac
+*.wma
+
+# Python / IDE
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
