@@ -2,16 +2,25 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List
 
 import config
 
+log = logging.getLogger("groq-llm")
+
 DEFAULT_GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 DEFAULT_TEMPERATURE = float(os.environ.get("GROQ_TEMPERATURE", "0.1"))
 DEFAULT_MAX_TOKENS = int(os.environ.get("GROQ_MAX_TOKENS", "3000"))
 DEFAULT_TIMEOUT_SECONDS = float(os.environ.get("GROQ_TIMEOUT_SECONDS", "60"))
+STRUCTURED_TEMPERATURE = float(os.environ.get("GROQ_STRUCTURED_TEMPERATURE", "0.0"))
+STRUCTURED_MAX_ATTEMPTS = max(1, int(os.environ.get("GROQ_STRUCTURED_MAX_ATTEMPTS", "3")))
+STRUCTURED_RETRY_DELAY_SECONDS = max(
+    0.0, float(os.environ.get("GROQ_STRUCTURED_RETRY_DELAY_SECONDS", "0.75"))
+)
 MAX_SUMMARY_CONTEXT_CHARS = int(os.environ.get("GROQ_SUMMARY_CONTEXT_CHARS", "70000"))
 MAX_QA_CONTEXT_CHARS = int(os.environ.get("GROQ_QA_CONTEXT_CHARS", "24000"))
 MAX_EMAIL_CONTEXT_CHARS = int(os.environ.get("GROQ_EMAIL_CONTEXT_CHARS", "30000"))
@@ -76,6 +85,141 @@ def _client():
     return Groq(api_key=api_key, timeout=DEFAULT_TIMEOUT_SECONDS)
 
 
+def _is_schema_generation_error(exc: BaseException) -> bool:
+    """Return True only for retryable structured-output generation failures."""
+    message = str(exc or "").lower()
+    markers = (
+        "does not match the expected schema",
+        "failed_generation",
+        "json_schema",
+        "schema validation",
+        "schema_validation",
+    )
+    return any(marker in message for marker in markers)
+
+
+def _parse_json_content(content: Any) -> Dict[str, Any]:
+    if not content:
+        raise RuntimeError("Groq returned an empty response.")
+    try:
+        parsed = json.loads(str(content))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Groq returned invalid JSON: {str(content)[:500]}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"Groq returned JSON type {type(parsed).__name__}; expected an object."
+        )
+    return parsed
+
+
+def _apply_safe_schema_defaults(
+    data: Dict[str, Any],
+    schema: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Fill only safe missing values after JSON-object fallback."""
+    result = dict(data)
+    properties = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+
+    for key in required:
+        if key in result:
+            continue
+
+        prop = properties.get(key) or {}
+        prop_type = prop.get("type")
+
+        if prop_type == "array":
+            result[key] = []
+            continue
+
+        if isinstance(prop_type, list) and "null" in prop_type:
+            result[key] = None
+            continue
+
+        enum = prop.get("enum") or []
+        if "unspecified" in enum:
+            result[key] = "unspecified"
+
+    for key, prop in properties.items():
+        if key not in result or not isinstance(result.get(key), list):
+            continue
+
+        item_schema = prop.get("items") or {}
+        if item_schema.get("type") != "object":
+            continue
+
+        normalized_items = []
+        for item in result[key]:
+            if not isinstance(item, dict):
+                continue
+            normalized_items.append(_apply_safe_schema_defaults(item, item_schema))
+        result[key] = normalized_items
+
+    return result
+
+
+def _validate_required_fields(
+    data: Dict[str, Any],
+    schema: Dict[str, Any],
+    *,
+    path: str = "$",
+) -> None:
+    """Minimal local validation for fields relied on by this application."""
+    properties = schema.get("properties") or {}
+
+    for key in schema.get("required") or []:
+        if key not in data:
+            raise RuntimeError(f"Groq JSON is missing required field {path}.{key}")
+
+    for key, prop in properties.items():
+        if key not in data:
+            continue
+
+        value = data[key]
+        prop_type = prop.get("type")
+        allowed_types = prop_type if isinstance(prop_type, list) else [prop_type]
+
+        if value is None and "null" in allowed_types:
+            continue
+
+        valid = True
+        if "string" in allowed_types:
+            valid = isinstance(value, str)
+        elif "boolean" in allowed_types:
+            valid = isinstance(value, bool)
+        elif "array" in allowed_types:
+            valid = isinstance(value, list)
+        elif "object" in allowed_types:
+            valid = isinstance(value, dict)
+
+        if not valid:
+            raise RuntimeError(
+                f"Groq JSON field {path}.{key} has invalid type "
+                f"{type(value).__name__}; expected {prop_type}."
+            )
+
+        if isinstance(value, list):
+            item_schema = prop.get("items") or {}
+            if item_schema.get("type") == "object":
+                for idx, item in enumerate(value):
+                    if not isinstance(item, dict):
+                        raise RuntimeError(
+                            f"Groq JSON field {path}.{key}[{idx}] must be an object."
+                        )
+                    _validate_required_fields(
+                        item,
+                        item_schema,
+                        path=f"{path}.{key}[{idx}]",
+                    )
+
+        enum = prop.get("enum")
+        if enum is not None and value not in enum:
+            raise RuntimeError(
+                f"Groq JSON field {path}.{key} has value {value!r}, "
+                f"expected one of {enum!r}."
+            )
+
+
 def _strict_json_completion(
     *,
     schema_name: str,
@@ -84,13 +228,27 @@ def _strict_json_completion(
     user_prompt: str,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> Dict[str, Any]:
-    request: Dict[str, Any] = {
+    """Generate schema-constrained JSON with automatic recovery."""
+
+    client = _client()
+
+    structured_system_prompt = (
+        system_prompt.rstrip()
+        + "\n\nSTRUCTURED OUTPUT REQUIREMENTS:\n"
+        "- Return every property required by the supplied JSON schema.\n"
+        "- Never omit a required field.\n"
+        "- If a required array has no values, return an empty array [].\n"
+        "- If a required nullable value is unknown, return null.\n"
+        "- Do not add properties that are not defined by the schema."
+    )
+
+    strict_request: Dict[str, Any] = {
         "model": DEFAULT_GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": structured_system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": DEFAULT_TEMPERATURE,
+        "temperature": STRUCTURED_TEMPERATURE,
         "max_completion_tokens": int(max_tokens),
         "response_format": {
             "type": "json_schema",
@@ -101,16 +259,81 @@ def _strict_json_completion(
             },
         },
     }
+
     if DEFAULT_GROQ_MODEL.startswith("openai/gpt-oss-"):
-        request["reasoning_effort"] = "low"
-    response = _client().chat.completions.create(**request)
-    content = response.choices[0].message.content
-    if not content:
-        raise RuntimeError("Groq returned an empty response.")
+        strict_request["reasoning_effort"] = "low"
+
+    last_schema_error: BaseException | None = None
+
+    for attempt in range(1, STRUCTURED_MAX_ATTEMPTS + 1):
+        try:
+            response = client.chat.completions.create(**strict_request)
+            data = _parse_json_content(response.choices[0].message.content)
+            _validate_required_fields(data, schema)
+            return data
+
+        except Exception as exc:
+            if not _is_schema_generation_error(exc):
+                raise
+
+            last_schema_error = exc
+            log.warning(
+                "Groq structured-output attempt %d/%d failed schema validation: %s",
+                attempt,
+                STRUCTURED_MAX_ATTEMPTS,
+                str(exc).splitlines()[0][:500],
+            )
+
+            if (
+                attempt < STRUCTURED_MAX_ATTEMPTS
+                and STRUCTURED_RETRY_DELAY_SECONDS > 0
+            ):
+                time.sleep(STRUCTURED_RETRY_DELAY_SECONDS * attempt)
+
+    log.warning(
+        "Groq strict structured output failed %d time(s); "
+        "using JSON Object Mode fallback for schema %s.",
+        STRUCTURED_MAX_ATTEMPTS,
+        schema_name,
+    )
+
+    fallback_prompt = (
+        user_prompt.rstrip()
+        + "\n\nReturn exactly one JSON object matching this schema. "
+        "Every required field MUST be present. "
+        "Use [] for empty required arrays and null for unknown nullable fields. "
+        "Do not add extra fields.\n\n"
+        + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+    )
+
+    fallback_request: Dict[str, Any] = {
+        "model": DEFAULT_GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": structured_system_prompt},
+            {"role": "user", "content": fallback_prompt},
+        ],
+        "temperature": 0.0,
+        "max_completion_tokens": int(max_tokens),
+        "response_format": {"type": "json_object"},
+    }
+
+    if DEFAULT_GROQ_MODEL.startswith("openai/gpt-oss-"):
+        fallback_request["reasoning_effort"] = "low"
+
     try:
-        return json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Groq returned invalid JSON: {content[:500]}") from exc
+        response = client.chat.completions.create(**fallback_request)
+        data = _parse_json_content(response.choices[0].message.content)
+        data = _apply_safe_schema_defaults(data, schema)
+        _validate_required_fields(data, schema)
+        return data
+
+    except Exception as fallback_exc:
+        raise RuntimeError(
+            "Groq could not produce valid structured JSON after "
+            f"{STRUCTURED_MAX_ATTEMPTS} strict attempt(s) and one JSON-object "
+            f"fallback. Last strict error: {last_schema_error}. "
+            f"Fallback error: {fallback_exc}"
+        ) from fallback_exc
 
 
 def _trim(text: str, limit: int) -> str:
